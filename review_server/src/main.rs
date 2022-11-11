@@ -1,4 +1,5 @@
 use std::net::SocketAddrV4;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use structopt::StructOpt;
@@ -45,7 +46,7 @@ struct Args {
         short,
         long,
         default_value = "5",
-        help = "Мас. количество одновременных запросов"
+        help = "Макс. количество одновременных запросов"
     )]
     limit: usize,
     #[structopt(
@@ -64,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (tx, rx) = watch::channel(());
     let queue = Arc::new(Semaphore::new(args.limit));
+    let queue_counter = Arc::new(AtomicUsize::default());
     let data = Arc::new(Mutex::new(Vec::new()));
 
     let mut handlers = Vec::new();
@@ -73,7 +75,13 @@ async fn main() -> anyhow::Result<()> {
             connection = listener.accept() => {
                 let (stream, _) = connection?;
 
-                let join_handler = tokio::spawn(handle_client(stream, Arc::clone(&data), Arc::clone(&queue), rx.clone()));
+                let join_handler = tokio::spawn(handle_client(
+                    stream,
+                    Arc::clone(&data),
+                    Arc::clone(&queue),
+                    Arc::clone(&queue_counter),
+                    rx.clone()
+                ));
                 handlers.push(join_handler);
             },
             signal_result = tokio::signal::ctrl_c() => {
@@ -91,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
 
     let blocked = match tokio::time::timeout(timeout, join_all_handler).await {
         Ok(_) => 0, // Если получилось сджойнить все таски, значит все запросы были обработаны
-        Err(_) => args.limit - queue.available_permits(),
+        Err(_) => queue_counter.load(Ordering::SeqCst),
     };
 
     print_total_statistic(data, blocked);
@@ -103,6 +111,7 @@ pub async fn handle_client(
     stream: TcpStream,
     data: Arc<Mutex<Vec<ClientStatistic>>>,
     queue: Arc<Semaphore>,
+    queue_counter: Arc<AtomicUsize>,
     mut stop_signal: watch::Receiver<()>,
 ) -> anyhow::Result<()> {
     use h2::server;
@@ -111,7 +120,9 @@ pub async fn handle_client(
     use rand::rngs::SmallRng;
     use rand::SeedableRng;
 
+    queue_counter.fetch_add(1, Ordering::SeqCst);
     let _permit = queue.acquire_owned().await?;
+    queue_counter.fetch_sub(1, Ordering::SeqCst);
 
     let mut statistic = ClientStatistic::default();
 
