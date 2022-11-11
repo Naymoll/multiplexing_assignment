@@ -44,7 +44,7 @@ struct Args {
     #[structopt(
         short,
         long,
-        default_value = "10",
+        default_value = "5",
         help = "Мас. количество одновременных запросов"
     )]
     limit: usize,
