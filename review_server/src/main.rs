@@ -1,10 +1,11 @@
+use bytes::Bytes;
+use h2::server::SendResponse;
 use std::net::SocketAddrV4;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use structopt::StructOpt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{mpsc, watch, Semaphore};
 
 #[derive(Debug)]
 pub struct ClientStatistic {
@@ -63,9 +64,10 @@ async fn main() -> anyhow::Result<()> {
     simple_logger::init()?;
     let args: Args = Args::from_args();
 
-    let (tx, rx) = watch::channel(());
+    let (watch_tx, watch_rx) = watch::channel(());
+    let (mpsc_tx, mut mpsc_rx) = mpsc::channel(1);
+
     let queue = Arc::new(Semaphore::new(args.limit));
-    let queue_counter = Arc::new(AtomicUsize::default());
     let data = Arc::new(Mutex::new(Vec::new()));
 
     let mut handlers = Vec::new();
@@ -75,32 +77,46 @@ async fn main() -> anyhow::Result<()> {
             connection = listener.accept() => {
                 let (stream, _) = connection?;
 
-                let join_handler = tokio::spawn(handle_client(
+                let handler = tokio::spawn(handle_client(
                     stream,
                     Arc::clone(&data),
                     Arc::clone(&queue),
-                    Arc::clone(&queue_counter),
-                    rx.clone()
+                    watch_rx.clone(),
+                    mpsc_tx.clone(),
                 ));
-                handlers.push(join_handler);
+                handlers.push(handler);
             },
             signal_result = tokio::signal::ctrl_c() => {
                 signal_result?;
                 log::info!("Ctrl-c received");
 
-                let _ = tx.send(()); // Игнорируем ошибку
+                let _ = watch_tx.send(()); // Игнорируем ошибку
                 break;
             },
         }
     }
 
-    let timeout = Duration::from_secs(args.shutdown_time_sec);
-    let join_all_handler = futures::future::join_all(handlers);
+    drop(mpsc_tx); // Дропаем, чтобы mpsc_rx работал корректно.
 
-    let blocked = match tokio::time::timeout(timeout, join_all_handler).await {
-        Ok(_) => 0, // Если получилось сджойнить все таски, значит все запросы были обработаны
-        Err(_) => queue_counter.load(Ordering::SeqCst),
+    let timeout = Duration::from_secs(args.shutdown_time_sec);
+    if tokio::time::timeout(timeout, mpsc_rx.recv()).await.is_err() {
+        log::error!("Tasks not finished");
+
+        // Если mpsc_rx.recv не выполнился, значит какие-то такси все еще работают. Их отменяем.
+        // Такую технику подсмотрел здесь https://tokio.rs/tokio/topics/shutdown
+        handlers
+            .iter()
+            .filter(|handler| !handler.is_finished())
+            .for_each(|handler| handler.abort());
     };
+
+    let join_all = futures::future::join_all(handlers).await;
+    let blocked = join_all
+        .into_iter()
+        .fold(0, |counter, handler| match handler {
+            Ok(Ok(_)) => counter,
+            _ => counter + 1, // Либо отмена таски, либо ошибка при обработке запросов
+        });
 
     print_total_statistic(data, blocked);
 
@@ -111,8 +127,8 @@ pub async fn handle_client(
     stream: TcpStream,
     data: Arc<Mutex<Vec<ClientStatistic>>>,
     queue: Arc<Semaphore>,
-    queue_counter: Arc<AtomicUsize>,
     mut stop_signal: watch::Receiver<()>,
+    _shutdowned: mpsc::Sender<()>,
 ) -> anyhow::Result<()> {
     use h2::server;
     use rand::distributions::Distribution;
@@ -120,38 +136,41 @@ pub async fn handle_client(
     use rand::rngs::SmallRng;
     use rand::SeedableRng;
 
-    queue_counter.fetch_add(1, Ordering::SeqCst);
     let _permit = queue.acquire_owned().await?;
-    queue_counter.fetch_sub(1, Ordering::SeqCst);
-
-    let mut statistic = ClientStatistic::default();
 
     let between = Uniform::new_inclusive(100, 500);
     let mut rng = SmallRng::from_entropy();
 
     let addr = stream.peer_addr()?;
     let mut connection = server::handshake(stream).await?;
-    log::info!("Client {} connected", addr);
+    log::info!("{}: connected", addr);
 
+    let mut handlers = Vec::new();
     while let Some(request) = connection.accept().await {
-        let (_, mut responder) = request?;
+        let (_, responder) = request?;
+
+        let routine_time = Duration::from_millis(between.sample(&mut rng));
+        let handler = tokio::spawn(client_routine(responder, routine_time));
+        handlers.push(handler);
 
         if let Ok(true) = stop_signal.has_changed() {
             // Можно сделать так же через tokio::select и stop_signal.changed().await
             connection.graceful_shutdown();
             let _ = stop_signal.borrow_and_update();
         }
-
-        let routine_time = Duration::from_millis(between.sample(&mut rng));
-        tokio::time::sleep(routine_time).await;
-
-        let response = http::Response::builder()
-            .status(http::StatusCode::OK)
-            .body(())?;
-
-        let _ = responder.send_response(response, true)?;
-        statistic.update(routine_time);
     }
+
+    // Если произошла какая-то ошибка, то мы не смогли до конца обработать запросы клиентов
+    // В таком случае возвращаем ошибку, т.к. данные не отображают полную статистику
+    let try_join_all = futures::future::try_join_all(handlers).await?;
+    let statistic = try_join_all.into_iter().try_fold(
+        ClientStatistic::default(),
+        |mut total, routine_result| {
+            let time = routine_result?;
+            total.update(time);
+            Ok::<_, anyhow::Error>(total)
+        },
+    )?;
 
     let mut guard = match data.lock() {
         Ok(g) => g,
@@ -159,8 +178,22 @@ pub async fn handle_client(
     };
     guard.push(statistic);
 
-    log::info!("Client {} disconnected", addr);
+    log::info!("{}: disconnected", addr);
     Ok(())
+}
+
+pub async fn client_routine(
+    mut responder: SendResponse<Bytes>,
+    routine_time: Duration,
+) -> anyhow::Result<Duration> {
+    let response = http::Response::builder()
+        .status(http::StatusCode::OK)
+        .body(())?;
+
+    tokio::time::sleep(routine_time).await;
+
+    let _ = responder.send_response(response, true)?;
+    Ok(routine_time)
 }
 
 fn print_total_statistic(data: Arc<Mutex<Vec<ClientStatistic>>>, blocked: usize) {
