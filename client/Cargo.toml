@@ -1,18 +1,17 @@
 [package]
-name = "review_server"
+name = "client"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0.66"
+h2 = { version = "0.3.15", features = ["stream"] }
 tokio = { version = "1.21.2", features = ["full"] }
 structopt = "0.3.26"
-rand = { version = "0.8.5", features = ["small_rng"] }
-h2 = { version = "0.3.15", features = ["stream"] }
+anyhow = "1.0.66"
+bytes = "1.2.1"
 http = "0.2.8"
 log = "0.4.17"
 simple_logger = "4.0.0"
-bytes = "1.2.1"
 futures = "0.3.25"
